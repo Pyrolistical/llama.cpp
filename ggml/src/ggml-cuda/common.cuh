@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1530,6 +1531,74 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    struct mmvq_q8_1_reuse {
+        std::unordered_map<const void *, std::unordered_set<const ggml_tensor *>> plans;
+        // producing tensor -> the tensor the consuming mat-vec passes as src1, which may be a
+        // reshape of it; the cache is keyed on identity, so the producer has to store under that.
+        std::unordered_map<const void *, std::unordered_map<const ggml_tensor *, const ggml_tensor *>> producer_plans;
+
+        const std::unordered_set<const ggml_tensor *> * plan = nullptr;
+        const std::unordered_map<const ggml_tensor *, const ggml_tensor *> * producers = nullptr;
+
+        const ggml_tensor * src1      = nullptr;
+        const void *        base      = nullptr;
+        int                 stream_no = -1;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+
+        std::unordered_set<const ggml_tensor *> & plan_for(const void * key) {
+            std::unordered_set<const ggml_tensor *> & entry = plans[key];
+            entry.clear();
+            return entry;
+        }
+
+        // activations whose producing kernel writes the q8_1 copy itself
+        std::unordered_map<const ggml_tensor *, const ggml_tensor *> & producers_for(const void * key) {
+            std::unordered_map<const ggml_tensor *, const ggml_tensor *> & entry = producer_plans[key];
+            entry.clear();
+            return entry;
+        }
+
+        const ggml_tensor * producer_key(const ggml_tensor * t) const {
+            if (producers == nullptr) {
+                return nullptr;
+            }
+            const auto it = producers->find(t);
+            return it == producers->end() ? nullptr : it->second;
+        }
+
+        void begin(const void * key) {
+            const auto it = plans.find(key);
+            plan = it == plans.end() ? nullptr : &it->second;
+
+            const auto pit = producer_plans.find(key);
+            producers = pit == producer_plans.end() ? nullptr : &pit->second;
+
+            src1      = nullptr;
+            base      = nullptr;
+            stream_no = -1;
+            buf.reset();
+        }
+
+        bool is_shared(const ggml_tensor * t) const {
+            return plan != nullptr && plan->find(t) != plan->end();
+        }
+
+        char * lookup(const ggml_tensor * t, int stream) const {
+            if (buf && src1 == t && base == t->data && stream_no == stream) {
+                return buf->ptr;
+            }
+            return nullptr;
+        }
+
+        char * store(ggml_cuda_pool & pool, const ggml_tensor * t, int stream, size_t size) {
+            buf       = std::make_unique<ggml_cuda_pool_alloc<char>>(pool, size);
+            src1      = t;
+            base      = t->data;
+            stream_no = stream;
+            return buf->ptr;
+        }
+    } mmvq_q8_1;
 };
 
 struct ggml_cuda_mm_fusion_args_host {
@@ -1538,7 +1607,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    const ggml_tensor * x_post_mul = nullptr;
     ggml_glu_op glu_op;
+    ggml_unary_op x_unary_op = GGML_UNARY_OP_COUNT;
     float glu_limit = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
@@ -1547,7 +1618,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    const void * x_post_mul = nullptr;
     ggml_glu_op glu_op;
+    ggml_unary_op x_unary_op = GGML_UNARY_OP_COUNT;
     float glu_limit = 0.0f;
 };
 

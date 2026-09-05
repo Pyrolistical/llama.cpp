@@ -3424,6 +3424,99 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// how many shape-preserving reshape nodes a mul_mat fusion will step over to reach its epilogue
+#define GGML_CUDA_FUSE_MAX_RESHAPES 2
+
+// unary ops the mat-vec kernel can apply to its own result before storing it
+static bool ggml_cuda_mmvq_fusable_unary(const ggml_tensor * node) {
+    if (node->op != GGML_OP_UNARY || node->type != GGML_TYPE_F32) {
+        return false;
+    }
+    switch (ggml_get_unary_op(node)) {
+        case GGML_UNARY_OP_SILU:
+        case GGML_UNARY_OP_SIGMOID:
+        case GGML_UNARY_OP_SOFTPLUS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// A gate that is a strided slice of a wider projection is materialised by a copy before the unary
+// and the multiply read it. Those two already index their operands as (row, col) with independent
+// row strides, so the copy is doing nothing the multiply could not do itself. Matches
+//   CPY(view) -> UNARY -> MUL   and drops the copy.
+static int ggml_cuda_cont_gate_end(const ggml_cgraph * cgraph, int i, const ggml_tensor ** gate_view) {
+    static const bool disabled =
+        getenv("GGML_CUDA_NO_CONT_GATE_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_CONT_GATE_FUSE"));
+
+    const ggml_tensor * cpy = cgraph->nodes[i];
+    if (disabled || (cpy->op != GGML_OP_CPY && cpy->op != GGML_OP_CONT) || cpy->type != GGML_TYPE_F32) {
+        return -1;
+    }
+
+    const ggml_tensor * view = cpy->src[0];
+    if (view == nullptr || view->view_src == nullptr || view->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    // rows contiguous, a constant stride between them, and nothing packed into the higher dims
+    if (view->nb[0] != sizeof(float) || view->ne[2] != 1 || view->ne[3] != 1) {
+        return -1;
+    }
+    if (view->nb[1] % sizeof(float) != 0 || view->nb[1] < view->ne[0] * (int64_t) sizeof(float)) {
+        return -1;
+    }
+    if (!ggml_is_contiguous(cpy) || ggml_nelements(cpy) != ggml_nelements(view)) {
+        return -1;
+    }
+    // the copy exists only to feed the unary
+    if (ggml_node_get_use_count(cgraph, i) != 1) {
+        return -1;
+    }
+
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j + 1 >= cgraph->n_nodes || j > i + 1 + GGML_CUDA_FUSE_MAX_RESHAPES) {
+        return -1;
+    }
+
+    const ggml_tensor * un = cgraph->nodes[j];
+    if (un->op != GGML_OP_UNARY || un->src[0] != cpy) {
+        return -1;
+    }
+    const ggml_unary_op uop = ggml_get_unary_op(un);
+    if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID) {
+        return -1;
+    }
+    if (ggml_node_get_use_count(cgraph, j) != 1) {
+        return -1;
+    }
+
+    const ggml_tensor * mul = cgraph->nodes[j + 1];
+    if (mul->op != GGML_OP_MUL || (mul->src[0] != un && mul->src[1] != un)) {
+        return -1;
+    }
+    const ggml_tensor * other = mul->src[0] == un ? mul->src[1] : mul->src[0];
+    if (other == nullptr || other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    if (!ggml_is_contiguous(other) || !ggml_is_contiguous(mul)) {
+        return -1;
+    }
+    if (ggml_nelements(other) != ggml_nelements(view) || ggml_nelements(mul) != ggml_nelements(view)) {
+        return -1;
+    }
+    if ((un->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (mul->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return -1;
+    }
+    // the copy feeds only the unary, which the use count above already establishes
+
+    *gate_view = view;
+    return j + 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4066,59 +4159,179 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
-    // mul_mat + add
+    {
+        const ggml_tensor * gate_view = nullptr;
+        const int j = ggml_cuda_cont_gate_end(cgraph, i, &gate_view);
+        if (j > 0) {
+            ggml_cuda_op_unary_mul_view(*cuda_ctx, cgraph->nodes[j - 1], cgraph->nodes[j], gate_view);
+            return j - i;
+        }
+    }
+
+    // mul_mat + add, tolerating shape-preserving reshapes between the two
+    static const bool no_reshape_fuse =
+        getenv("GGML_CUDA_NO_RESHAPE_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_RESHAPE_FUSE"));
+    static const bool no_unary_fuse =
+        getenv("GGML_CUDA_NO_UNARY_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_UNARY_FUSE"));
+
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
-        if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
+        if (cgraph->nodes[i]->op != op) {
             continue;
         }
 
-        ggml_tensor * mm_node   = cgraph->nodes[i];
-        ggml_tensor * bias_node = cgraph->nodes[i + 1];
+        int     idxs[4 + GGML_CUDA_FUSE_MAX_RESHAPES];
+        ggml_op ops [4 + GGML_CUDA_FUSE_MAX_RESHAPES];
 
+        idxs[0] = i;
+        ops [0] = op;
+
+        int           n_fuse = 1;
+        ggml_tensor * chain  = cgraph->nodes[i];
+
+        while (!no_reshape_fuse && n_fuse < 1 + GGML_CUDA_FUSE_MAX_RESHAPES && i + n_fuse < cgraph->n_nodes) {
+            ggml_tensor * reshape = cgraph->nodes[i + n_fuse];
+            if (reshape->op != GGML_OP_RESHAPE || reshape->src[0] != chain) {
+                break;
+            }
+            idxs[n_fuse] = i + n_fuse;
+            ops [n_fuse] = GGML_OP_RESHAPE;
+            chain        = reshape;
+            n_fuse++;
+        }
+
+        // optional bias add
+        ggml_tensor * bias_node   = nullptr;
         ggml_tensor * bias_tensor = nullptr;
-        if (bias_op == GGML_OP_ADD) {
-            if (bias_node->src[0] == mm_node) {
+        if (i + n_fuse < cgraph->n_nodes && cgraph->nodes[i + n_fuse]->op == bias_op) {
+            bias_node = cgraph->nodes[i + n_fuse];
+            if (bias_op == GGML_OP_ADD) {
+                if (bias_node->src[0] == chain) {
+                    bias_tensor = bias_node->src[1];
+                } else if (bias_node->src[1] == chain) {
+                    bias_tensor = bias_node->src[0];
+                }
+            } else if (bias_node->src[0] == chain) {
                 bias_tensor = bias_node->src[1];
-            } else if (bias_node->src[1] == mm_node) {
-                bias_tensor = bias_node->src[0];
+            }
+            if (bias_tensor) {
+                idxs[n_fuse] = i + n_fuse;
+                ops [n_fuse] = bias_op;
+                n_fuse++;
+                chain = bias_node;
             } else {
-                continue;
+                bias_node = nullptr;
             }
-        } else {
-            if (bias_node->src[0] != mm_node) {
-                continue;
-            }
-            bias_tensor = bias_node->src[1];
         }
 
-        const ggml_tensor * src0 = mm_node->src[0];
-        const ggml_tensor * src1 = mm_node->src[1];
-        const ggml_tensor * ids  = mm_node->src[2];
+        // the mat-vec kernel can also apply a unary and a post-multiply to its own result;
+        // only the quantised path implements that, so remember where the bias-only fusion ended
+        const int     n_fuse_bias     = n_fuse;
+        ggml_tensor * bias_only_out   = bias_node;
+        ggml_tensor * unary_node      = nullptr;
+        ggml_tensor * post_mul_tensor = nullptr;
 
-        if (bias_op == GGML_OP_ADD_ID && bias_node->src[2] != ids) {
+        if (!no_unary_fuse && op == GGML_OP_MUL_MAT && i + n_fuse < cgraph->n_nodes &&
+                ggml_cuda_mmvq_fusable_unary(cgraph->nodes[i + n_fuse]) &&
+                cgraph->nodes[i + n_fuse]->src[0] == chain) {
+            unary_node   = cgraph->nodes[i + n_fuse];
+            idxs[n_fuse] = i + n_fuse;
+            ops [n_fuse] = GGML_OP_UNARY;
+            n_fuse++;
+            chain = unary_node;
+
+            if (i + n_fuse < cgraph->n_nodes && cgraph->nodes[i + n_fuse]->op == GGML_OP_MUL) {
+                ggml_tensor * mul_node = cgraph->nodes[i + n_fuse];
+                ggml_tensor * other    = mul_node->src[0] == chain ? mul_node->src[1]
+                                       : mul_node->src[1] == chain ? mul_node->src[0]
+                                       : nullptr;
+                if (other && other->type == GGML_TYPE_F32 && ggml_are_same_shape(mul_node->src[0], mul_node->src[1])) {
+                    post_mul_tensor = other;
+                    idxs[n_fuse]    = i + n_fuse;
+                    ops [n_fuse]    = GGML_OP_MUL;
+                    n_fuse++;
+                    chain = mul_node;
+                }
+            }
+        }
+
+        if (!bias_node && !unary_node) {
             continue;
         }
 
-        if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
-            continue;
+        ggml_tensor * mm_node = cgraph->nodes[i];
+
+        // try the longest chain first, then fall back to bias only for the float path
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            const bool with_unary = attempt == 0 && unary_node != nullptr;
+            const int  n_try      = with_unary ? n_fuse : n_fuse_bias;
+
+            if (attempt == 1 && (unary_node == nullptr || bias_only_out == nullptr)) {
+                break;
+            }
+
+            ggml_tensor * out_node = cgraph->nodes[idxs[n_try - 1]];
+            const int     out_nodes[] = { idxs[n_try - 1] };
+
+            if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n_try, ops, out_nodes, 1)) {
+                continue;
+            }
+
+            // The mat-vec kernel derives its store pattern from the destination's shape, so a
+            // reshape that rearranged ne cannot be written through directly. When the chain is a
+            // pure contiguous alias of the same elements, describe the destination with the
+            // mat-vec's own shape and only borrow the final node's memory. Restricted to chains
+            // with no bias or post-multiply, whose vectors are indexed with that same shape.
+            ggml_tensor   dst_alias;
+            ggml_tensor * dst_node = out_node;
+            if (!ggml_are_same_shape(mm_node, out_node)) {
+                if (bias_tensor || post_mul_tensor ||
+                        out_node->type != mm_node->type ||
+                        !ggml_is_contiguous(out_node) || !ggml_is_contiguous(mm_node) ||
+                        ggml_nelements(out_node) != ggml_nelements(mm_node)) {
+                    continue;
+                }
+                memcpy(&dst_alias, mm_node, sizeof(ggml_tensor));
+                dst_alias.data   = out_node->data;
+                dst_alias.buffer = out_node->buffer;
+                dst_node         = &dst_alias;
+            }
+            if (bias_op == GGML_OP_ADD && bias_node &&
+                    !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
+                continue;
+            }
+            if (bias_op == GGML_OP_ADD_ID && bias_node && bias_node->src[2] != mm_node->src[2]) {
+                continue;
+            }
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.x_bias = bias_tensor;
+            if (with_unary) {
+                fusion_data.x_unary_op = ggml_get_unary_op(unary_node);
+                fusion_data.x_post_mul = post_mul_tensor;
+            }
+
+            const ggml_tensor * src0 = mm_node->src[0];
+            const ggml_tensor * src1 = mm_node->src[1];
+            const ggml_tensor * ids  = mm_node->src[2];
+
+            if (!with_unary && ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, dst_node, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = n_try;
+                break;
+            }
+
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, dst_node, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = n_try;
+                break;
+            }
         }
 
-        ggml_cuda_mm_fusion_args_host fusion_data{};
-        fusion_data.x_bias = bias_tensor;
-
-        if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
-            ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
-            fused_mul_mat_vec = true;
-            fused_node_count  = 2;
-            break;
-        }
-
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
-            fused_mul_mat_vec = true;
-            fused_node_count  = 2;
+        if (fused_mul_mat_vec) {
             break;
         }
     }
@@ -4417,6 +4630,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    cuda_ctx->mmvq_q8_1.begin(cgraph->n_nodes > 0 ? (const void *) cgraph->nodes[0] : nullptr);
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4496,8 +4711,116 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+static void ggml_cuda_mmvq_plan_reuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    if (cgraph->n_nodes <= 0) {
+        return;
+    }
+
+    const auto root = [](const ggml_tensor * t) {
+        return t->view_src ? t->view_src : t;
+    };
+
+    std::unordered_map<const ggml_tensor *, std::vector<int>> written_at;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        written_at[root(cgraph->nodes[i])].push_back(i);
+    }
+
+    std::unordered_map<const ggml_tensor *, std::pair<int, int>> uses;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+
+        const ggml_tensor * src1 = node->src[1];
+        if (src1 == nullptr || src1->type != GGML_TYPE_F32) {
+            continue;
+        }
+
+        const auto it = uses.find(src1);
+        if (it == uses.end()) {
+            uses[src1] = { i, i };
+        } else {
+            it->second.second = i;
+        }
+    }
+
+    // An activation produced by a fused RMS_NORM + MUL can be quantised by that kernel, which
+    // already holds the whole row, instead of by a dispatch of its own before the mat-vec.
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> & producers = cuda_ctx->mmvq_q8_1.producers_for(cgraph->nodes[0]);
+
+    // The mat-vec may be handed a reshape of the produced activation rather than the activation
+    // itself. Any such alias shares the data pointer and the element layout, so the producer can
+    // fill the buffer, but it has to be stored under the tensor the mat-vec will look up.
+    const auto consumer_key = [&](const ggml_tensor * t, int from) -> const ggml_tensor * {
+        for (int j = from; j < cgraph->n_nodes; j++) {
+            const ggml_tensor * node = cgraph->nodes[j];
+            if (node->op != GGML_OP_MUL_MAT || !ggml_is_quantized(node->src[0]->type)) {
+                continue;
+            }
+            const ggml_tensor * src1 = node->src[1];
+            if (src1 == t) {
+                return t;
+            }
+            if (src1 != nullptr && src1->data == t->data && src1->type == t->type &&
+                    ggml_nelements(src1) == ggml_nelements(t) &&
+                    ggml_is_contiguous(src1) && root(src1) == root(t)) {
+                return src1;
+            }
+        }
+        return nullptr;
+    };
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        // a gated activation writes its result in one pass and can quantise it on the way out
+        if (node->op == GGML_OP_GLU) {
+            if (const ggml_tensor * key = consumer_key(node, i + 1)) {
+                producers[node] = key;
+            }
+            continue;
+        }
+
+        if (i + 1 >= cgraph->n_nodes) {
+            continue;
+        }
+
+        const ggml_tensor * next = cgraph->nodes[i + 1];
+        if ((node->op != GGML_OP_RMS_NORM && node->op != GGML_OP_UNARY) || next->op != GGML_OP_MUL) {
+            continue;
+        }
+        if (next->src[0] != node && next->src[1] != node) {
+            continue;
+        }
+        if (const ggml_tensor * key = consumer_key(next, i + 2)) {
+            producers[next] = key;
+        }
+    }
+
+    std::unordered_set<const ggml_tensor *> & plan = cuda_ctx->mmvq_q8_1.plan_for(cgraph->nodes[0]);
+
+    for (const auto & [src1, span] : uses) {
+        if (span.first == span.second) {
+            continue;
+        }
+
+        const auto it = written_at.find(root(src1));
+        if (it != written_at.end()) {
+            const auto after = std::upper_bound(it->second.begin(), it->second.end(), span.first);
+            if (after != it->second.end() && *after <= span.second) {
+                continue;
+            }
+        }
+
+        plan.insert(src1);
+    }
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_cuda_mmvq_plan_reuse(cuda_ctx, cgraph);
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
