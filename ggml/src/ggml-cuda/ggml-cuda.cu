@@ -311,6 +311,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
+        info.devices[id].resident_waves =
+            prop.multiProcessorCount * (prop.maxThreadsPerMultiProcessor / prop.warpSize);
 
 #ifndef GGML_USE_MUSA
         int supports_coop_launch = 0;
