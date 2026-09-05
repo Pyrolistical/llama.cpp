@@ -939,13 +939,19 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
+    uint32_t whole_aux[2];
+    uint32_t split_aux[2];
+
+    whole_aux[0] = scales[j+0] & 0x3f3f;
+    whole_aux[1] = scales[j+2] & 0x3f3f;
+
+    split_aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[(j-2) & 3] & 0xc0c0) >> 2);
+    split_aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+
+    const uint32_t use_whole = j < 2 ? 0xffffffffu : 0u;
+
+    aux[0] = (uint16_t)((use_whole & whole_aux[0]) | (~use_whole & split_aux[0]));
+    aux[1] = (uint16_t)((use_whole & whole_aux[1]) | (~use_whole & split_aux[1]));
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
@@ -984,13 +990,19 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
+    uint32_t whole_aux[2];
+    uint32_t split_aux[2];
+
+    whole_aux[0] = scales[j+0] & 0x3f3f;
+    whole_aux[1] = scales[j+2] & 0x3f3f;
+
+    split_aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[(j-2) & 3] & 0xc0c0) >> 2);
+    split_aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+
+    const uint32_t use_whole = j < 2 ? 0xffffffffu : 0u;
+
+    aux[0] = (uint16_t)((use_whole & whole_aux[0]) | (~use_whole & split_aux[0]));
+    aux[1] = (uint16_t)((use_whole & whole_aux[1]) | (~use_whole & split_aux[1]));
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
