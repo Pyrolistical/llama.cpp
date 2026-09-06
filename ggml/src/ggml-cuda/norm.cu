@@ -277,6 +277,47 @@ static __global__ void l2_norm_f32(
     }
 }
 
+// Two L2 norms over disjoint slices of the same tensor, in one dispatch. Qwen3.5 normalises the
+// convolved q and k views of one buffer, which are the same shape and share the source strides, so
+// the pair is one grid twice as tall with the upper half reading the second slice.
+template <int block_size>
+static __global__ void l2_norm_pair_f32(
+        const float * x0, float * dst0, const float * x1, float * dst1,
+        const int ncols, const int nrows, const int64_t stride_row, const int64_t stride_channel,
+        const int64_t stride_sample, const float eps) {
+    const int nchannels = gridDim.y;
+
+    const int which   = blockIdx.x >= (uint32_t) nrows;
+    const int row     = which ? blockIdx.x - nrows : blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    const float * x   = which ? x1   : x0;
+    float       * dst = which ? dst1 : dst0;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    ggml_cuda_pdl_lc();
+
+    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * x[col];
+    }
+}
+
 static void norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
@@ -671,6 +712,42 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(eps >= 0.0f);
 
     rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
+}
+
+void ggml_cuda_op_l2_norm_pair(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b) {
+    const ggml_tensor * a_src = a->src[0];
+    const ggml_tensor * b_src = b->src[0];
+
+    float eps;
+    memcpy(&eps, a->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const size_t ts0 = ggml_type_size(a_src->type);
+    const int64_t s01 = a_src->nb[1] / ts0;
+    const int64_t s02 = a_src->nb[2] / ts0;
+    const int64_t s03 = a_src->nb[3] / ts0;
+
+    const int ncols     = a_src->ne[0];
+    const int nrows     = a_src->ne[1];
+    const int nchannels = a_src->ne[2];
+    const int nsamples  = a_src->ne[3];
+
+    cudaStream_t stream = ctx.stream();
+    const dim3 blocks_num(2*nrows, nchannels, nsamples);
+
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(l2_norm_pair_f32<WARP_SIZE>, launch_params,
+            (const float *) a_src->data, (float *) a->data, (const float *) b_src->data, (float *) b->data,
+            ncols, nrows, s01, s02, s03, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32*sizeof(float) : 0, stream};
+        ggml_cuda_kernel_launch(l2_norm_pair_f32<1024>, launch_params,
+            (const float *) a_src->data, (float *) a->data, (const float *) b_src->data, (float *) b->data,
+            ncols, nrows, s01, s02, s03, eps);
+    }
 }
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

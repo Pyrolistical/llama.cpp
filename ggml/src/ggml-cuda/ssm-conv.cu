@@ -1,5 +1,7 @@
 #include "common.cuh"
 #include "ssm-conv.cuh"
+
+#include <type_traits>
 #include "unary.cuh"
 
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
@@ -154,6 +156,161 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
         case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
         case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
         default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+    }
+}
+
+// Fused conv-window assembly + recurrent state write-back + short convolution (+ silu).
+//
+// The graph builds a [d_conv, channels] window by concatenating the d_conv-1 stored taps with the
+// new column, copies the last d_conv-1 columns of that window back to the state, and convolves it.
+// At batch size one all three touch the same few numbers per channel, so do them in one thread:
+// it reads the stored taps and the new column into registers before writing the state back, and no
+// other thread touches that channel, so the read/write overlap on the state is safe.
+template <bool apply_silu, int d_conv, bool with_l2>
+static __global__ void ssm_conv_state_fused_f32(const float * __restrict__ state,
+                                                const float * __restrict__ xnew,
+                                                const float * __restrict__ weight,
+                                                const float * __restrict__ bias,
+                                                float * __restrict__       dst,
+                                                float * __restrict__       state_out,
+                                                const int channels,
+                                                const int stride_state_channel,
+                                                const int stride_state_seq,
+                                                const int stride_xnew_channel,
+                                                const int stride_xnew_seq,
+                                                const int stride_weight_channel,
+                                                const int stride_dst_seq,
+                                                const int stride_state_out_seq,
+                                                float * __restrict__       dst_q,
+                                                float * __restrict__       dst_k,
+                                                const int q_channels,
+                                                const int k_channels,
+                                                const float l2_eps) {
+    ggml_cuda_pdl_lc();
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    const int s = blockIdx.y;
+
+    if (c >= channels) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    float x[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; ++j) {
+        x[j] = state[s*stride_state_seq + c*stride_state_channel + j];
+    }
+    x[d_conv - 1] = xnew[s*stride_xnew_seq + c*stride_xnew_channel];
+
+    const float * w = weight + c*stride_weight_channel;
+
+    float sumf = 0.0f;
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        sumf += x[j] * w[j];
+    }
+    sumf += bias != nullptr ? bias[c] : 0.0f;
+
+    const float val = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+    dst[s*stride_dst_seq + c] = val;
+
+    float * so = state_out + s*stride_state_out_seq + c*(d_conv - 1);
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; ++j) {
+        so[j] = x[j + 1];
+    }
+
+    // The q and k slices of this output are L2 normalised next, one row per 128 channels. A block
+    // covers 256 channels, so it holds exactly two whole rows and can normalise them here. The
+    // reduction below walks the row in the same order and the same tree as l2_norm_pair_f32, so the
+    // result is bit identical to running that kernel afterwards.
+    if constexpr (with_l2) {
+        constexpr int row_width = 128;
+        const int block_base = blockIdx.x * blockDim.x;
+        const bool in_q = block_base < q_channels;
+        const bool in_k = !in_q && block_base < q_channels + k_channels;
+        if (!in_q && !in_k) {
+            return;
+        }
+
+        __shared__ float s_val[2*row_width];
+        __shared__ float s_scale[2];
+        s_val[threadIdx.x] = val;
+        __syncthreads();
+
+        const int row = threadIdx.x / row_width;
+        const int t   = threadIdx.x % row_width;
+        if (t < WARP_SIZE) {
+            float tmp = 0.0f;
+            for (int col = t; col < row_width; col += WARP_SIZE) {
+                const float xi = s_val[row*row_width + col];
+                tmp += xi * xi;
+            }
+            tmp = warp_reduce_sum<WARP_SIZE>(tmp);
+            if (t == 0) {
+                s_scale[row] = rsqrtf(fmaxf(tmp, l2_eps * l2_eps));
+            }
+        }
+        __syncthreads();
+
+        float * dn = in_q ? dst_q : dst_k;
+        dn[c - (in_q ? 0 : q_channels)] = val * s_scale[row];
+    }
+}
+
+void ggml_cuda_op_ssm_conv_state_fused(ggml_backend_cuda_context & ctx,
+                                       ggml_tensor * concat, ggml_tensor * cpy,
+                                       ggml_tensor * ssm_conv, ggml_tensor * silu,
+                                       ggml_tensor * l2_q, ggml_tensor * l2_k) {
+    const ggml_tensor * state  = concat->src[0];
+    const ggml_tensor * xnew   = concat->src[1];
+    const ggml_tensor * weight = ssm_conv->src[1];
+    const ggml_tensor * out    = silu ? silu : ssm_conv;
+
+    const int64_t d_conv   = weight->ne[0];
+    const int64_t channels = state->ne[1];
+    const int64_t n_seqs   = out->ne[2];
+
+    GGML_ASSERT(d_conv == 4);
+    GGML_ASSERT(out->ne[1] == 1);
+
+    const int stride_state_channel  = state->nb[1] / sizeof(float);
+    const int stride_state_seq      = state->nb[2] / sizeof(float);
+    const int stride_xnew_channel   = xnew->nb[1]  / sizeof(float);
+    const int stride_xnew_seq       = xnew->nb[2]  / sizeof(float);
+    const int stride_weight_channel = weight->nb[1] / sizeof(float);
+    const int stride_dst_seq        = out->nb[2] / sizeof(float);
+    const int stride_state_out_seq  = cpy->nb[1] / sizeof(float);
+
+    const int threads = 256;
+    const dim3 blocks((channels + threads - 1) / threads, n_seqs, 1);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(blocks, dim3(threads, 1, 1), 0, ctx.stream());
+
+    const int   q_channels = l2_q ? (int) ggml_nelements(l2_q) : 0;
+    const int   k_channels = l2_k ? (int) ggml_nelements(l2_k) : 0;
+    const float l2_eps     = l2_q ? ((const float *) l2_q->op_params)[0] : 0.0f;
+
+    const auto launch = [&](auto silu_tag, auto l2_tag) {
+        ggml_cuda_kernel_launch(
+            ssm_conv_state_fused_f32<decltype(silu_tag)::value, 4, decltype(l2_tag)::value>, launch_params,
+            (const float *) state->data, (const float *) xnew->data, (const float *) weight->data,
+            (const float *) nullptr, (float *) out->data, (float *) cpy->data,
+            (int) channels, stride_state_channel, stride_state_seq, stride_xnew_channel,
+            stride_xnew_seq, stride_weight_channel, stride_dst_seq, stride_state_out_seq,
+            l2_q ? (float *) l2_q->data : nullptr, l2_k ? (float *) l2_k->data : nullptr,
+            q_channels, k_channels, l2_eps);
+    };
+
+    if (silu && l2_q) {
+        launch(std::true_type{},  std::true_type{});
+    } else if (silu) {
+        launch(std::true_type{},  std::false_type{});
+    } else if (l2_q) {
+        launch(std::false_type{}, std::true_type{});
+    } else {
+        launch(std::false_type{}, std::false_type{});
     }
 }
 

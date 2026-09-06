@@ -3422,6 +3422,264 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
     return false;
 }
+// the tensor a view ultimately aliases
+static const ggml_tensor * ggml_cuda_alloc_root(const ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// how many view or no-op nodes a fusion will step over to reach the next op it wants
+#define GGML_CUDA_FUSE_MAX_VIEWS 2
+
+// Two L2 norms over disjoint slices of one tensor can share a dispatch. They are independent, so
+// the only ordering that matters is that the second does not read the first's output, and the nodes
+// between them must be views, which the backend does not execute anyway.
+static int ggml_cuda_l2_norm_pair_end(const ggml_cgraph * cgraph, int i) {
+    static const bool disabled =
+        getenv("GGML_CUDA_NO_L2_NORM_PAIR") != nullptr && std::atoi(getenv("GGML_CUDA_NO_L2_NORM_PAIR"));
+
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (disabled || a->op != GGML_OP_L2_NORM) {
+        return -1;
+    }
+
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes || j > i + 1 + GGML_CUDA_FUSE_MAX_VIEWS) {
+        return -1;
+    }
+
+    const ggml_tensor * b = cgraph->nodes[j];
+    if (b->op != GGML_OP_L2_NORM) {
+        return -1;
+    }
+    if ((a->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return -1;
+    }
+
+    const ggml_tensor * a_src = a->src[0];
+    const ggml_tensor * b_src = b->src[0];
+
+    // the second must not read what the first writes: the two run unsynchronised in one grid
+    if (b_src == a || ggml_cuda_alloc_root(b_src) == ggml_cuda_alloc_root(a)) {
+        return -1;
+    }
+
+    if (a_src->type != GGML_TYPE_F32 || b_src->type != GGML_TYPE_F32 ||
+        a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    if (!ggml_are_same_shape(a_src, b_src) || !ggml_are_same_shape(a, b)) {
+        return -1;
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b)) {
+        return -1;
+    }
+    // one kernel, one set of source strides
+    if (a_src->nb[0] != b_src->nb[0] || a_src->nb[1] != b_src->nb[1] ||
+        a_src->nb[2] != b_src->nb[2] || a_src->nb[3] != b_src->nb[3]) {
+        return -1;
+    }
+    if (a_src->nb[0] != ggml_type_size(a_src->type)) {
+        return -1;
+    }
+
+    float eps_a;
+    float eps_b;
+    memcpy(&eps_a, a->op_params, sizeof(float));
+    memcpy(&eps_b, b->op_params, sizeof(float));
+    if (eps_a != eps_b) {
+        return -1;
+    }
+
+    return j;
+}
+
+// Matches the conv-window chain a delta-net layer builds every token:
+//   CONCAT(stored taps, new column) -> CPY(window[1:] -> state) -> SSM_CONV -> SILU
+// The nodes in between are views and empty no-ops, which the backend does not execute, so the four
+// can share one dispatch. Anchored on the CONCAT and refused unless everything skipped is a no-op.
+struct ggml_cuda_conv_state_chain {
+    ggml_tensor * cpy      = nullptr;
+    ggml_tensor * ssm_conv = nullptr;
+    ggml_tensor * silu     = nullptr;
+    ggml_tensor * l2_q     = nullptr;
+    ggml_tensor * l2_k     = nullptr;
+    int           last_idx = -1;
+};
+
+// The q and k slices of the conv output are L2 normalised straight afterwards, one row per 128
+// channels. The conv dispatch runs 256 threads per block, so a block holds exactly two whole rows
+// and can normalise them without a second dispatch. Everything here is a shape check; the kernel
+// reduces in the same order as l2_norm_pair_f32, so the result is bit identical.
+static void ggml_cuda_match_conv_l2(const ggml_cgraph * cgraph, int j, const ggml_tensor * out,
+                                    ggml_cuda_conv_state_chain & m) {
+    static const bool disabled =
+        getenv("GGML_CUDA_NO_CONV_L2_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_CONV_L2_FUSE"));
+    if (disabled || out->ne[2] != 1 || out->ne[3] != 1) {
+        return;
+    }
+
+    ggml_tensor * norm[2] = { nullptr, nullptr };
+    int           idx[2]  = { -1, -1 };
+    for (int n = 0; n < 2; ++n) {
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_L2_NORM) {
+            return;
+        }
+        norm[n] = cgraph->nodes[j];
+        idx[n]  = j;
+        j++;
+    }
+
+    for (int n = 0; n < 2; ++n) {
+        const ggml_tensor * src = norm[n]->src[0];
+        if ((norm[n]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return;
+        }
+        if (src == nullptr || ggml_cuda_alloc_root(src) != out) {
+            return;
+        }
+        if (norm[n]->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32) {
+            return;
+        }
+        if (!ggml_is_contiguous(norm[n]) || !ggml_is_contiguous(src)) {
+            return;
+        }
+        // one row per 128 channels is what lets a 256-thread block own two whole rows
+        if (src->ne[0] != 128 || src->ne[2] != 1 || src->ne[3] != 1) {
+            return;
+        }
+    }
+    if (((const float *) norm[0]->op_params)[0] != ((const float *) norm[1]->op_params)[0]) {
+        return;
+    }
+
+    // q at the start of the conv output, k directly after it
+    const int64_t off_q = (const char *) norm[0]->src[0]->data - (const char *) out->data;
+    const int64_t off_k = (const char *) norm[1]->src[0]->data - (const char *) out->data;
+    const int64_t n_q   = ggml_nelements(norm[0]->src[0]);
+    const int64_t n_k   = ggml_nelements(norm[1]->src[0]);
+    if (off_q != 0 || off_k != n_q * (int64_t) sizeof(float)) {
+        return;
+    }
+    if (n_q % 256 != 0 || n_k % 256 != 0 || n_q + n_k > out->ne[0]) {
+        return;
+    }
+
+    m.l2_q     = norm[0];
+    m.l2_k     = norm[1];
+    m.last_idx = idx[1];
+}
+
+static bool ggml_cuda_match_conv_state_chain(const ggml_cgraph * cgraph, int i, ggml_cuda_conv_state_chain & m) {
+    static const bool disabled =
+        getenv("GGML_CUDA_NO_CONV_STATE_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_CONV_STATE_FUSE"));
+
+    ggml_tensor * concat = cgraph->nodes[i];
+    if (disabled || concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (((const int32_t *) concat->op_params)[0] != 0) {
+        return false;
+    }
+
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * xnew  = concat->src[1];
+    if (state == nullptr || xnew == nullptr ||
+        state->type != GGML_TYPE_F32 || xnew->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // [d_conv-1, channels, seqs] concatenated with [1, channels, seqs] along dim 0
+    if (xnew->ne[0] != 1 || state->ne[0] + 1 != concat->ne[0] ||
+        state->ne[1] != xnew->ne[1] || state->ne[2] != xnew->ne[2]) {
+        return false;
+    }
+    if (state->nb[0] != sizeof(float) || concat->ne[1] != state->ne[1]) {
+        return false;
+    }
+
+    // one dispatch covers one token
+    if (concat->ne[2] < 1 || concat->ne[3] != 1) {
+        return false;
+    }
+
+    // walk forward, allowing only nodes the backend would not execute anyway
+    int  j        = i + 1;
+    auto skip_noops = [&]() {
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+    };
+
+    skip_noops();
+    if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_CPY) {
+        return false;
+    }
+    ggml_tensor * cpy = cgraph->nodes[j];
+    // the copy source must be the tail of the window we just described
+    const ggml_tensor * tail = cpy->src[0];
+    if (tail == nullptr || ggml_cuda_alloc_root(tail) != concat ||
+        tail->ne[0] != state->ne[0] || tail->ne[1] != state->ne[1] || tail->ne[2] != state->ne[2]) {
+        return false;
+    }
+    if (cpy->type != GGML_TYPE_F32 || cpy->nb[0] != sizeof(float) ||
+        ggml_nelements(cpy) != ggml_nelements(tail)) {
+        return false;
+    }
+
+    j++;
+    skip_noops();
+    if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_SSM_CONV) {
+        return false;
+    }
+    ggml_tensor * ssm_conv = cgraph->nodes[j];
+    if (ssm_conv->src[0] != concat || ssm_conv->src[1]->ne[0] != concat->ne[0]) {
+        return false;
+    }
+    if (ssm_conv->src[1]->ne[0] != 4 || ssm_conv->src[1]->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    ggml_tensor * silu = nullptr;
+    if (j + 1 < cgraph->n_nodes) {
+        ggml_tensor * next = cgraph->nodes[j + 1];
+        if (next->op == GGML_OP_UNARY && ggml_get_unary_op(next) == GGML_UNARY_OP_SILU &&
+                next->src[0] == ssm_conv && next->type == GGML_TYPE_F32) {
+            silu = next;
+            j++;
+        }
+    }
+
+    ggml_tensor * out = silu ? silu : ssm_conv;
+    if (out->ne[1] != 1 || out->ne[0] != state->ne[1]) {
+        return false;
+    }
+
+    // the window must not be read by anything outside the chain
+    if (ggml_node_get_use_count(cgraph, i) != 2) {
+        return false;
+    }
+    // and the conv result must not be read by anything but the silu we folded in
+    if (silu && ggml_node_get_use_count(cgraph, j - 1) != 1) {
+        return false;
+    }
+
+    m.cpy      = cpy;
+    m.ssm_conv = ssm_conv;
+    m.silu     = silu;
+    m.last_idx = j;
+
+    ggml_cuda_match_conv_l2(cgraph, j + 1, out, m);
+    return true;
+}
+
 
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -3457,6 +3715,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
         }
+    }
+
+    if (ggml_cuda_conv_state_chain chain; ggml_cuda_match_conv_state_chain(cgraph, i, chain)) {
+        ggml_cuda_op_ssm_conv_state_fused(*cuda_ctx, cgraph->nodes[i], chain.cpy, chain.ssm_conv, chain.silu,
+                                          chain.l2_q, chain.l2_k);
+        return chain.last_idx - i;
+    }
+
+    if (const int j = ggml_cuda_l2_norm_pair_end(cgraph, i); j > 0) {
+        ggml_cuda_op_l2_norm_pair(*cuda_ctx, cgraph->nodes[i], cgraph->nodes[j]);
+        return j - i;
     }
 
     //topk-moe

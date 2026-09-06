@@ -176,6 +176,7 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+    bool    s_copy_is_noop(uint32_t n_seqs) const;
 
 private:
     const llama_memory_status status;

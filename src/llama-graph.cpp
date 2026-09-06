@@ -357,6 +357,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
 
+    res &= s_copy_noop == mctx->s_copy_is_noop(params.ubatch.n_seqs);
+
     return res;
 }
 
@@ -3407,6 +3409,11 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
 }
 
+static bool is_plain_get_rows(const llm_graph_get_rows_fn & fn) {
+    const auto * target = fn.target<ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *)>();
+    return target != nullptr && *target == ggml_get_rows;
+}
+
 ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
         ggml_tensor * state_copy_main,
@@ -3417,6 +3424,7 @@ ggml_tensor * llm_graph_context::build_rs(
            uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
+               bool   copy_noop,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
     GGML_UNUSED(rs_size);
@@ -3430,7 +3438,9 @@ ggml_tensor * llm_graph_context::build_rs(
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
     // {state_size, rs_size} -> {state_size, n_seqs}
-    ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
+    ggml_tensor * output_states = copy_noop && is_plain_get_rows(get_state_rows) && states->type == GGML_TYPE_F32
+        ? ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1])
+        : get_state_rows(ctx0, states, state_copy_main);
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
@@ -3462,6 +3472,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
+    inp->s_copy_noop = mctx_cur->s_copy_is_noop(n_seqs);
+
     return inp;
 }
 
@@ -3483,7 +3495,7 @@ ggml_tensor * llm_graph_context::build_rs(
 
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
-                    get_state_rows);
+                    inp->s_copy_noop, get_state_rows);
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
